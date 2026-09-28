@@ -1,0 +1,114 @@
+users
+├── id (UUID, PK)
+├── email (VARCHAR, UNIQUE, NOT NULL)
+├── username (VARCHAR, UNIQUE, NOT NULL)
+├── password_hash (TEXT, NOT NULL)
+├── role (ENUM: student, admin)
+├── is_active (BOOLEAN, DEFAULT true)
+├── last_login_at (TIMESTAMPTZ)
+├── created_at (TIMESTAMPTZ, DEFAULT NOW())
+└── updated_at (TIMESTAMPTZ, DEFAULT NOW())
+
+user_sessions
+├── id (UUID, PK)
+├── user_id (UUID, FK → users.id, ON DELETE CASCADE, NOT NULL)
+├── refresh_token_hash (TEXT, NOT NULL)
+├── ip_address (INET)
+├── user_agent (TEXT)
+├── expires_at (TIMESTAMPTZ, NOT NULL)
+├── revoked_at (TIMESTAMPTZ, nullable)
+├── created_at (TIMESTAMPTZ, DEFAULT NOW())
+└── last_used_at (TIMESTAMPTZ)
+INDEX: user_id, (expires_at, revoked_at)
+
+project_templates
+├── id (UUID, PK)
+├── name (VARCHAR, NOT NULL)
+├── slug (VARCHAR, UNIQUE, NOT NULL)
+├── language (VARCHAR)
+├── runtime_version (VARCHAR)
+├── description (TEXT)
+├── is_active (BOOLEAN, DEFAULT true)
+├── created_at (TIMESTAMPTZ, DEFAULT NOW())
+└── updated_at (TIMESTAMPTZ, DEFAULT NOW())
+
+projects
+├── id (UUID, PK)
+├── user_id (UUID, FK → users.id, ON DELETE CASCADE, NOT NULL)
+├── template_id (UUID, FK → project_templates.id, ON DELETE SET NULL, nullable)
+├── project_name (VARCHAR, NOT NULL)
+├── status (ENUM: active, archived)
+├── deleted_at (TIMESTAMPTZ, nullable)
+├── created_at (TIMESTAMPTZ, DEFAULT NOW())
+└── updated_at (TIMESTAMPTZ, DEFAULT NOW())
+INDEX: user_id, status
+UNIQUE: (user_id, project_name) WHERE deleted_at IS NULL
+
+environments
+├── id (UUID, PK)
+├── project_id (UUID, FK → projects.id, ON DELETE CASCADE, NOT NULL)
+├── requested_by_user_id (UUID, FK → users.id, ON DELETE SET NULL, NOT NULL)
+├── status (ENUM: created, starting, running, stopped, failed, deleting)
+├── k8s_namespace (VARCHAR, UNIQUE, NOT NULL)
+├── cpu_limit_millicores (INT, DEFAULT 1000)
+├── memory_limit_mb (INT, DEFAULT 1024)
+├── storage_limit_mb (INT, DEFAULT 5120)
+├── pid_limit (INT, DEFAULT 256)
+├── idle_timeout_sec (INT, DEFAULT 1800)
+├── started_at (TIMESTAMPTZ)
+├── stopped_at (TIMESTAMPTZ)
+├── last_activity_at (TIMESTAMPTZ)
+├── failure_reason (TEXT)
+├── deleted_at (TIMESTAMPTZ, nullable)
+├── created_at (TIMESTAMPTZ, DEFAULT NOW())
+└── updated_at (TIMESTAMPTZ, DEFAULT NOW())
+INDEX: project_id, status, last_activity_at
+
+workspace_deployment
+├── id (UUID, PK)
+├── environment_id (UUID, FK → environments.id, ON DELETE CASCADE, NOT NULL)
+├── deployment_name (VARCHAR, NOT NULL)
+├── image_used (TEXT)
+├── replica_count (INT, DEFAULT 1)
+├── container_name (VARCHAR)
+├── container_port (INT)
+├── protocol (VARCHAR: TCP, HTTP)
+├── label (VARCHAR)
+├── status (VARCHAR: creating, ready, updating, failed)
+├── created_at (TIMESTAMPTZ, DEFAULT NOW())
+├── updated_at (TIMESTAMPTZ, DEFAULT NOW())
+└── deleted_at (TIMESTAMPTZ, nullable)
+INDEX: environment_id
+
+workspace_services
+├── id (UUID, PK)
+├── environment_id (UUID, FK → environments.id, ON DELETE CASCADE, NOT NULL)
+├── service_name (VARCHAR, NOT NULL)
+├── service_type (VARCHAR, DEFAULT ClusterIP)
+├── port (INT, NOT NULL)
+├── deployment_id (UUID, FK → workspace_deployment.id, ON DELETE SET NULL, nullable)
+└── created_at (TIMESTAMPTZ, DEFAULT NOW())
+INDEX: environment_id
+UNIQUE: (environment_id, service_name)
+
+workspace_ingresses
+├── id (UUID, PK)
+├── environment_id (UUID, FK → environments.id, ON DELETE CASCADE, NOT NULL)
+├── ingress_name (VARCHAR, NOT NULL)
+├── tls_enabled (BOOLEAN, DEFAULT false)
+├── tls_cert_secret_name (VARCHAR, nullable)
+└── created_at (TIMESTAMPTZ, DEFAULT NOW())
+INDEX: environment_id
+UNIQUE: (environment_id, ingress_name)
+
+ingress_rules
+├── id (UUID, PK)
+├── ingress_id (UUID, FK → workspace_ingresses.id, ON DELETE CASCADE, NOT NULL)
+├── rule_order (INT, NOT NULL)
+├── host (VARCHAR, NOT NULL)
+├── path (VARCHAR, DEFAULT /)
+├── path_type (VARCHAR: Prefix, Exact)
+├── service_id (UUID, FK → workspace_services.id, ON DELETE CASCADE, NOT NULL)
+└── created_at (TIMESTAMPTZ, DEFAULT NOW())
+INDEX: ingress_id, service_id
+UNIQUE: (ingress_id, rule_order)

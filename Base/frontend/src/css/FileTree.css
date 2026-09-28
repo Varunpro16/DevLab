@@ -1,0 +1,18 @@
+
+.file-tree {
+  padding: 10px;
+  font-family: monospace;
+}
+
+.tree-item {
+  cursor: pointer;
+  margin: 4px 0;
+}
+
+.tree-item:hover {
+  color: white;
+}
+
+.folder {
+  font-weight: bold;
+}

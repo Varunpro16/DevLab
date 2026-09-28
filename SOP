@@ -1,0 +1,381 @@
+# Replit Clone: Online Lab Platform - Complete Project SOP
+
+## 1. Project Overview
+
+**What is it?**
+An online coding lab platform for college students. Students log in, create projects from templates (React, Node, Python, C++), write code in a browser-based IDE with a file tree and terminal, and get real-time preview of their work. Designed for coursework, DevOps labs, web dev assignments, and system programming practices.
+
+**Why built this way?**
+- Single medium EC2 instance running K3s (lightweight Kubernetes)
+- Each student's project runs in an isolated pod with resource limits
+- No managed AWS services (no ALB, Route53, ECR, CloudWatch) — cost-conscious MVP
+- Students can't break other students' work or the main system
+
+---
+
+## 2. User Journey (Student Perspective)
+
+### Step 1: Sign Up & Login
+- Student visits the platform
+- Creates account (email/username/password)
+- System stores hashed password in `users` table
+- Creates a `user_sessions` row with JWT token
+- Browser stores `access_token` in localStorage (15-min lifetime)
+
+### Step 2: Create Project
+- Dashboard shows available templates: React, Node, Python, C++
+- Student clicks "Create Project" → chooses template → names it "My Portfolio"
+- System:
+  1. Inserts row in `projects` table with `template_id` reference
+  2. Copies template files from S3 (`s3://bucket/templates/react/`) to project S3 prefix (`s3://bucket/projects/user-123/my-portfolio/`)
+  3. Sets project status to `active`
+  
+### Step 3: Start Environment (Workspace)
+- Student clicks "Start" on project
+- System:
+  1. Creates `environments` row (status: `created`)
+  2. Creates K3s Namespace for isolation
+  3. Creates `workspace_deployment` (Kubernetes Deployment YAML)
+  4. Deploys pod running the appropriate runtime (Node container, Python container, etc.)
+  5. Updates environment status → `starting` → `running`
+  6. Creates `workspace_services` and `workspace_ingresses` for networking
+  7. Generates preview URL: `app-portfolio-user123.platform.com`
+
+### Step 4: Code & Test (IDE)
+- Student opens browser IDE
+- **File Tree Panel**: Lists files from S3 (fetched via ListObjects, not DB metadata)
+- **Editor Panel**: Monaco editor — can edit HTML, JS, CSS, Python, etc.
+- **Terminal Panel**: WebSocket connection to pod → can run `npm install`, `python script.py`, `curl http://localhost:3000`, etc.
+- **Preview Panel**: Shows live preview of web app at the generated URL
+
+### Step 5: Deploy & Share
+- Student clicks "Deploy"
+- System builds Docker image from `Dockerfile` in project
+- Pushes to registry (GHCR)
+- Updates `workspace_deployment.image_used` with new tag
+- Redeploys pod with new image
+- App goes live at preview URL
+
+### Step 6: Logout
+- Student clicks logout
+- System marks `user_sessions.revoked_at = NOW()` (not deleted)
+- Access token invalidated immediately
+- Next request with old token gets 401 Unauthorized
+
+---
+
+## 3. Technical Architecture (System Perspective)
+
+### Three Layers:
+
+**Layer 1: Control Plane** (Trusted)
+- Go backend API (single binary)
+- Handles auth, project CRUD, file management, K8s orchestration
+- Stateless: all state in PostgreSQL or K3s API
+- Runs in platform namespace on K3s
+
+**Layer 2: Data Planes** (Untrusted)
+- One Kubernetes namespace per student project environment
+- Each namespace has:
+  - One pod (running student's code)
+  - One Service (K3s networking)
+  - One Ingress rule (routes traffic to pod)
+  - ResourceQuota + LimitRange (prevents resource hogging)
+  - NetworkPolicy (blocks traffic to other namespaces)
+  - No root privileges, limited system capabilities
+
+**Layer 3: Storage** (External)
+- PostgreSQL (metadata: users, projects, environments, sessions, deployments)
+- S3 (project files, templates, build artifacts)
+- Both accessed via Go backend only
+
+### Network Flow:
+
+```
+Student Browser → Internet → EC2 Public IP → K3s Ingress Controller
+                                                      ↓
+                                          Ingress routes by host
+                                                      ↓
+                            ┌─────────────────┬─────────────────┐
+                            ↓                 ↓                 ↓
+                    Platform Namespace    Namespace-1       Namespace-2
+                    (Go Backend, UI)    (Alice's Project)  (Bob's Project)
+                            ↓                 ↓                 ↓
+                        Go API Pod    Isolated App Pod   Isolated App Pod
+                            ↓                 ↓                 ↓
+                        PostgreSQL ← ← ← Read/Write Metadata
+                        S3 ← ← ← Read/Write Files
+```
+
+---
+
+## 4. Core Operations
+
+### Operation A: Authentication Flow
+
+1. **Register**
+   - User POSTs email/username/password to `/api/auth/register`
+   - Go backend validates input, hashes password with bcrypt
+   - Inserts into `users` table (role: `student`)
+   - Returns success message
+
+2. **Login**
+   - User POSTs email/password to `/api/auth/login`
+   - Backend queries `users` table, verifies bcrypt hash
+   - Generates JWT tokens:
+     - `access_token`: short-lived (15 min), contains `session_id` in payload
+     - `refresh_token`: long-lived (7 days), hashed before storage
+   - Inserts row in `user_sessions` table with token hashes and metadata (IP, User-Agent)
+   - Returns tokens to browser
+
+3. **Protected Request**
+   - Browser sends API request with `Authorization: Bearer <access_token>`
+   - Go backend middleware:
+     1. Verifies JWT signature (stateless check)
+     2. Extracts `session_id` from payload
+     3. Queries `user_sessions` where `id = session_id`
+     4. Checks: `expires_at > NOW()` AND `revoked_at IS NULL`
+     5. Updates `last_used_at = NOW()` (for idle timeout)
+   - If valid → allow request; if invalid → 401 Unauthorized
+
+4. **Token Refresh**
+   - Access token expired (15 min passed)
+   - Browser POSTs `refresh_token` to `/api/auth/refresh`
+   - Backend verifies refresh token against stored hash
+   - Issues new `access_token`
+   - Optionally rotates `refresh_token` (delete old, create new)
+
+5. **Logout**
+   - User clicks logout
+   - Browser POSTs to `/api/auth/logout`
+   - Backend sets `user_sessions.revoked_at = NOW()`
+   - All future requests with that session fail immediately
+
+### Operation B: Environment Lifecycle
+
+1. **Create (Start)**
+   - User clicks "Start Environment"
+   - Go backend:
+     - Inserts `environments` row (status: `created`)
+     - Creates K3s namespace: `env-<env-id>`
+     - Creates ResourceQuota (CPU: 1000m, Memory: 1GB, Storage: 5GB)
+     - Creates LimitRange (per-pod limits same)
+     - Creates NetworkPolicy (block external traffic, allow ingress only)
+     - Applies these via K3s API server
+   - Updates status → `starting` (waiting for pod to schedule)
+
+2. **Deployment & Networking**
+   - Backend creates `workspace_deployment` row
+   - Applies K8s Deployment YAML:
+     ```
+     namespace: env-<env-id>
+     replicas: 1
+     image: <registry>/<project-template>:latest
+     resources: CPU 1000m, Memory 1GB
+     labels: app=<env-id>
+     ```
+   - K8s scheduler places pod on node
+   - Backend polls K8s API until pod phase = `Running`
+   - Creates `workspace_services` row (type: ClusterIP, port: 3000 or 5000 depending on template)
+   - Applies K8s Service YAML:
+     ```
+     namespace: env-<env-id>
+     selector: app=<env-id>
+     port: 3000
+     targetPort: 3000
+     ```
+   - Creates `workspace_ingresses` + `ingress_rules` rows
+   - Applies K8s Ingress YAML:
+     ```
+     host: app-<project-name>-<user-id>.platform.com
+     path: /
+     backend: service <env-id>:3000
+     tls: enabled (certbot managed)
+     ```
+   - Updates environment status → `running`
+   - Student can now access preview URL
+
+3. **Stop**
+   - User clicks "Stop Environment"
+   - Backend:
+     - Updates `environments` status → `stopped`
+     - Deletes K8s Deployment (pods cascade-deleted)
+     - Deletes Service, Ingress, Namespace
+     - Sets `stopped_at = NOW()`
+   - Namespace cleaned up, no resources consumed
+
+4. **Auto-Idle**
+   - Background job checks all running environments
+   - If `NOW() - last_activity_at > 1800 seconds` (30 min)
+   - Automatically stops environment (same as above)
+
+### Operation C: File Management (IDE)
+
+1. **List Files**
+   - Frontend requests `GET /api/projects/<project-id>/files`
+   - Go backend calls S3 ListObjectsV2 with prefix `projects/user-123/my-portfolio/`
+   - S3 returns object list (not stored in DB)
+   - Frontend builds file tree UI from response
+
+2. **Read File**
+   - User clicks file in tree
+   - Frontend requests `GET /api/projects/<project-id>/files/<path>`
+   - Backend fetches from S3 using GetObject
+   - Returns file contents to editor
+
+3. **Write File**
+   - User edits and clicks save
+   - Frontend POSTs to `/api/projects/<project-id>/files/<path>` with new contents
+   - Backend puts to S3 using PutObject
+   - Frontend updates tree (no DB write)
+
+4. **Create/Delete**
+   - Create: PutObject new file to S3 prefix
+   - Delete: DeleteObject from S3
+   - All in S3, no DB state
+
+### Operation D: Terminal Access
+
+1. **Open Terminal**
+   - Frontend opens WebSocket to `/api/ws/terminal/<environment-id>`
+   - Go backend creates WebSocket handler
+   - Launches `kubectl exec -i -t <pod-name> -n <namespace> -- /bin/bash`
+   - Bridges WebSocket ↔ kubectl exec streams
+
+2. **Send Command**
+   - User types `npm install` in terminal
+   - Sent via WebSocket to Go handler
+   - Forwarded to pod stdin via kubectl exec
+   - Pod runs command
+
+3. **Receive Output**
+   - Pod stdout/stderr captured by kubectl exec
+   - Streamed back through Go handler
+   - Sent via WebSocket to browser
+   - Displayed in xterm.js terminal
+
+4. **Close Terminal**
+   - User closes terminal panel or WebSocket disconnects
+   - Go handler closes kubectl exec stream
+   - Backend records session end in `terminal_sessions` (if enabled for audit)
+
+---
+
+## 5. Database Schema Purpose (Why Each Table)
+
+| Table | Purpose |
+|-------|---------|
+| `users` | Core user records (email, hashed password, role) |
+| `user_sessions` | Session/token tracking (access token, refresh token, expiry, revocation) |
+| `project_templates` | Starter kits (React, Node, Python) with S3 template prefix |
+| `projects` | User's actual projects, linked to template and environment |
+| `environments` | Workspace state machine (created→starting→running→stopped) |
+| `workspace_deployment` | K8s Deployment config snapshot (image, replicas, container port) |
+| `workspace_services` | K8s Service config (port, cluster IP, deployment reference) |
+| `workspace_ingresses` | K8s Ingress config (TLS, certificate secret) |
+| `ingress_rules` | Routing rules (host, path, service mapping) |
+
+---
+
+## 6. Deployment & Infrastructure
+
+### EC2 Setup
+- **Instance Type**: t3.medium (2 vCPU, 4 GB RAM)
+- **OS**: Ubuntu 22.04
+- **Disk**: 30 GB EBS (gp3)
+- **Public IP**: Assigned (for Ingress traffic)
+
+### K3s Installation
+- Single-node cluster on EC2 (not high availability)
+- Nginx Ingress Controller (built-in)
+- Installed via: `curl -sfL https://get.k3s.io | sh -`
+- systemd service: `systemctl enable k3s`
+
+### TLS/Certificates
+- Let's Encrypt via certbot
+- Wildcard cert: `*.platform.com`
+- Renewed auto via certbot cron
+
+### Database
+- PostgreSQL 14+ on EC2 (or separate RDS for isolation)
+- Connection pooling via pgbouncer (optional, for MVP simplicity)
+
+### CI/CD (GitHub Actions)
+- **Frontend**: Lint → Test → Build → Push image to GHCR → Redeploy K8s Deployment
+- **Backend**: Lint → Test → Build binary → Push image to GHCR → Redeploy K8s Deployment
+
+---
+
+## 7. Security Model
+
+### Network Isolation
+- Each student environment in separate K8s namespace
+- NetworkPolicy blocks pod-to-pod traffic across namespaces
+- Ingress only route students can use
+
+### Compute Isolation
+- Pods run as non-root user (uid 1000+)
+- Linux capabilities dropped (NET_RAW, SYS_ADMIN, etc.)
+- seccomp RuntimeDefault profile
+- ResourceQuota prevents runaway resource consumption
+- PID limit prevents fork bombs
+
+### Authentication & Authorization
+- JWT tokens with HMAC-SHA256 signing
+- Session-based: session_id stored in JWT, validated against DB
+- Token revocation via `revoked_at` flag (immediate logout)
+- Refresh tokens hashed in DB (salted bcrypt)
+
+### Data Protection
+- S3 files: encrypted at rest (default SSE-S3)
+- PostgreSQL: TLS connection from Go backend
+- No secrets in environment variables (use K3s Secrets)
+
+---
+
+## 8. Monitoring & Operations
+
+### Observability (MVP, minimal)
+- Pod logs: `kubectl logs <pod-name> -n <namespace>`
+- Deployment status: Query K8s API daily
+- Failed environments: Background job marks with `failure_reason`
+- Audit logs: Track user actions (optional Phase 2)
+
+### Scaling Limitations
+- Single EC2 medium: ~50 concurrent environments max (1 vCPU per 50 pods)
+- If students exceed quota, new environments get queued
+- Go backend auto-restarts failed pods (reconciler loop)
+
+### Cost Optimization
+- Idle timeout (30 min) saves compute
+- No persistent storage (projects deleted when stopped)
+- S3 storage is cheap (templates + artifacts)
+
+---
+
+## 9. Workflow Timeline (8 Weeks)
+
+**Week 1**: EC2 + K3s + PostgreSQL setup  
+**Week 2**: Go backend auth endpoints (register, login, refresh, logout)  
+**Week 3**: S3 integration, file CRUD, JWT middleware  
+**Week 4**: K8s client-go integration (environment create/start/stop/delete)  
+**Week 5**: WebSocket terminal gateway, kubectl exec integration  
+**Week 6**: Docker build pipeline, image registry, Ingress URL generation  
+**Week 7**: Pod security policies, NetworkPolicy, ResourceQuota, TLS  
+**Week 8**: React frontend, GitHub Actions CI/CD, demo-ready  
+
+---
+
+## 10. Common Operations (Troubleshooting)
+
+| Issue | Investigation |
+|-------|---|
+| Can't login | Check `users` table, verify password hash, check session expiry in `user_sessions` |
+| Files not showing | Check S3 credentials, verify S3 prefix in `projects` table matches objects |
+| Environment won't start | Check K3s API, node capacity, pod logs via `kubectl logs` |
+| Terminal not responding | Check WebSocket connection, verify pod still running, check kubectl exec permissions |
+| Slow file upload | S3 multipart upload limits, check EBS IOPS burst |
+
+---
+
+This is the complete bird's-eye view of how the platform works. Every component — from login to terminal to deployment — flows through these documented operations.
